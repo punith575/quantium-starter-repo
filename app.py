@@ -1,80 +1,138 @@
-from pathlib import Path
-
+from dash import Dash, dcc, html, Input, Output
 import pandas as pd
 import plotly.express as px
-from dash import Dash, dcc, html, Input, Output
+
+# --- Config ---
+DATA_FILE = "output_sales.csv"
+CUTOFF_DATE = pd.Timestamp("2021-01-15")  # Price increase date
 
 
-# ---------- Load data ----------
-REPO_ROOT = Path(__file__).resolve().parent
-DATA_FILE = REPO_ROOT / "output_sales.csv"
+def load_data() -> pd.DataFrame:
+    df = pd.read_csv(DATA_FILE)
 
-df = pd.read_csv(DATA_FILE)
+    # Normalize column names (Sales -> sales, Date -> date, Region -> region, etc.)
+    df.columns = [c.strip().lower() for c in df.columns]
 
-# Ensure expected columns exist (Sales, Date, Region)
-df.columns = [c.strip() for c in df.columns]
+    # Basic validation
+    required = {"date", "region", "sales"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing required columns in {DATA_FILE}: {missing}")
 
-# Parse Date and clean Region
-df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-df["Region"] = df["Region"].astype(str).str.strip().str.lower()
+    # Clean types
+    df["region"] = df["region"].astype(str).str.strip().str.lower()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df["sales"] = pd.to_numeric(df["sales"], errors="coerce")
 
-# Drop rows with bad dates (just in case)
-df = df.dropna(subset=["Date"])
+    # Drop bad rows
+    df = df.dropna(subset=["date", "sales", "region"]).copy()
+
+    return df
 
 
-# ---------- Dash app ----------
+df_all = load_data()
+
+# Fixed order (as required by the task)
+REGION_OPTIONS = ["all", "north", "east", "south", "west"]
+
+
 app = Dash(__name__)
-app.title = "Pink Morsels Sales Visualizer"
-
-regions = sorted(df["Region"].dropna().unique().tolist())
-region_options = [{"label": "All", "value": "ALL"}] + [{"label": r.title(), "value": r} for r in regions]
+app.title = "Pink Morsel Sales Visualiser"
 
 app.layout = html.Div(
-    style={"maxWidth": "1000px", "margin": "40px auto", "fontFamily": "Arial"},
+    className="page",
     children=[
-        html.H1("Pink Morsels Sales Over Time"),
-        html.P("Use the dropdown to filter by region. The chart shows total sales per day."),
-
-        html.Label("Region"),
-        dcc.Dropdown(
-            id="region",
-            options=region_options,
-            value="ALL",
-            clearable=False,
-            style={"width": "300px"},
+        html.H1("Pink Morsel Sales Visualiser", className="title"),
+        html.P(
+            "Use the radio buttons to filter by region. The chart shows total sales per day.",
+            style={"marginBottom": "12px"},
         ),
 
-        dcc.Graph(id="sales-line"),
+        html.Div(
+            className="controls",
+            children=[
+                html.Div("Region", className="label"),
+                dcc.RadioItems(
+                  id="region_radio",
+                  options=[{"label": r.capitalize(), "value": r} for r in REGION_OPTIONS],
+                  value="all",
+                  inline=True,
+                  labelStyle={"marginRight": "14px"},
+                ),
+
+            ],
+        ),
+
+        dcc.Graph(id="sales_line_chart"),
+
+        html.Div(id="summary_text", style={"marginTop": "12px", "fontWeight": "600"}),
     ],
 )
 
 
 @app.callback(
-    Output("sales-line", "figure"),
-    Input("region", "value"),
+    Output("sales_line_chart", "figure"),
+    Output("summary_text", "children"),
+    Input("region_radio", "value"),
 )
-def update_chart(selected_region: str):
-    dff = df.copy()
+def update_chart(region_value: str):
+    # Filter by region
+    if region_value and region_value != "all":
+        dff = df_all[df_all["region"] == region_value].copy()
+        region_label = region_value.capitalize()
+    else:
+        dff = df_all.copy()
+        region_label = "All Regions"
 
-    if selected_region != "ALL":
-        dff = dff[dff["Region"] == selected_region]
-
-    # Total sales per day
+    # Group by date (sum sales), sort by date
     daily = (
-        dff.groupby("Date", as_index=False)["Sales"]
+        dff.groupby("date", as_index=False)["sales"]
         .sum()
-        .sort_values("Date")
+        .sort_values("date")
+        .copy()
     )
 
+    # Make sure x-axis is real datetime (prevents Plotly int+str error)
+    daily["date"] = pd.to_datetime(daily["date"])
+
+    # Build figure
     fig = px.line(
         daily,
-        x="Date",
-        y="Sales",
-        markers=True,
-        title="Total Sales per Day",
-        labels={"Date": "Date", "Sales": "Sales ($)"},
+        x="date",
+        y="sales",
+        title=f"Total Sales per Day ({region_label})",
+        labels={"date": "Date", "sales": "Sales ($)"},
     )
-    return fig
+    fig.update_xaxes(type="date")
+
+    # Add cutoff line + annotation (safe way)
+    fig.add_vline(x=CUTOFF_DATE, line_width=2, line_dash="dash")
+    fig.add_annotation(
+        x=CUTOFF_DATE,
+        y=1,
+        yref="paper",
+        text="Price increase (Jan 15, 2021)",
+        showarrow=False,
+        xanchor="left",
+        yanchor="top",
+    )
+
+    # Simple summary (before vs after)
+    before = daily[daily["date"] < CUTOFF_DATE]["sales"]
+    after = daily[daily["date"] >= CUTOFF_DATE]["sales"]
+
+    if len(before) == 0 or len(after) == 0:
+        summary = "Not enough data on both sides of Jan 15, 2021 to compare."
+    else:
+        before_avg = before.mean()
+        after_avg = after.mean()
+        verdict = "after" if after_avg > before_avg else "before"
+        summary = (
+            f"Average daily sales {verdict} the price increase. "
+            f"Before: {before_avg:,.0f} | After: {after_avg:,.0f}"
+        )
+
+    return fig, summary
 
 
 if __name__ == "__main__":
